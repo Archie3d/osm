@@ -63,13 +63,39 @@ public:
      */
     static Result<Map> load(const std::filesystem::path& filePath);
 
+    struct RenderOptions
+    {
+        // Cull eligible polygons only when BOTH dimensions are below this
+        // many target-image pixels. Zero disables LOD; must be finite and >= 0.
+        double m_minAreaSizePixels{2.0};
+    };
+
+    struct RenderStats
+    {
+        // Fill features, counted once (a complete multipolygon is one feature).
+        // Drawn means submitted to Blend2D, not necessarily visible after clipping.
+        std::size_t fillsConsidered{};
+        std::size_t fillsOffscreen{};
+        std::size_t fillsCulled{};
+        std::size_t fillsDrawn{};
+    };
+
     /**
-     * @brief Renders the specified region of the map using the provided Blend2D context.
+     * @brief Render the specified region of the map using the provided Blend2D context and render options.
      *
      * @param ctx Blend2D context used for rendering the map region.
      * @param region The region of the map to render.
-     * Invalid or zero-area regions return an error; empty geometry draws nothing.
-     * Existing context state and clipping are preserved.
+     * @param options Render options controlling level-of-detail and other settings.
+     * @param stats Optional structure to receive rendering statistics.
+     * @return Result<void>
+     */
+    Result<void> render(BLContext& ctx, const Region& region, const RenderOptions& options, RenderStats* stats = nullptr);
+
+    /**
+     * @brief Render the specified region of the map using the provided Blend2D context.
+     *
+     * @param ctx Blend2D context used for rendering the map region.
+     * @param region The region of the map to render.
      * @return Result<void>
      */
     Result<void> render(BLContext& ctx, const Region& region);
@@ -102,6 +128,7 @@ private:
         LabelMetadata m_label;
         bool m_closed{};
         bool m_casing{};
+        bool m_smallAreaLod{};
     };
 
     struct Area
@@ -111,6 +138,7 @@ private:
         Style m_style;
         Region m_bounds;
         LabelMetadata m_label;
+        bool m_smallAreaLod{};
     };
 
     struct Fill
@@ -127,6 +155,7 @@ private:
 
     void prepareRenderData();
     static LabelMetadata labelMetadata(const Tags& tags, int priority);
+    static bool smallAreaLod(const Tags& tags);
 
     std::vector<Fill> m_fills;
     std::vector<std::size_t> m_lines;

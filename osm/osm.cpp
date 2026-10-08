@@ -235,6 +235,16 @@ Map::LabelMetadata Map::labelMetadata(const Tags& tags, int priority)
     return metadata;
 }
 
+bool Map::smallAreaLod(const Tags& tags)
+{
+    // Roads and waterways retain their deliberately exaggerated stroke widths.
+    if (!tagValue(tags, "highway").empty() || !tagValue(tags, "waterway").empty()) {
+        return false;
+    }
+    const auto building = tagValue(tags, "building");
+    return (!building.empty() && building != "no") || !tagValue(tags, "landuse").empty();
+}
+
 void Map::prepareRenderData()
 {
     m_fills.clear();
@@ -276,6 +286,7 @@ void Map::prepareRenderData()
         way.m_label = labelMetadata(way.tags, way.m_closed ? 3 : 4);
         const bool highway = !tagValue(way.tags, "highway").empty();
         const bool filled = way.m_style.fill != 0 && way.m_closed;
+        way.m_smallAreaLod = filled && smallAreaLod(way.tags);
         const bool stroke = !(way.relationMember || filled) || highway || !tagValue(way.tags, "waterway").empty();
         way.m_casing = highway && way.m_style.width >= 3;
         if (filled && !way.areaMember) {
@@ -289,6 +300,7 @@ void Map::prepareRenderData()
         auto& area = m_areas[i];
         area.m_bounds = {90, 180, -90, -180};
         area.m_label = labelMetadata(area.tags, 3);
+        area.m_smallAreaLod = smallAreaLod(area.tags);
         double size = 0;
         for (const auto& ring : area.rings) {
             extendBounds(area.m_bounds, ring);
@@ -317,6 +329,18 @@ void Map::prepareRenderData()
 
 Result<void> Map::render(BLContext& ctx, const Region& region)
 {
+    return render(ctx, region, RenderOptions{});
+}
+
+Result<void> Map::render(BLContext& ctx, const Region& region,
+    const RenderOptions& options, RenderStats* stats)
+{
+    if (stats) {
+        *stats = {};
+    }
+    if (!std::isfinite(options.m_minAreaSizePixels) || options.m_minAreaSizePixels < 0) {
+        return std::unexpected("LOD threshold must be finite and nonnegative");
+    }
     if (!validRegion(region) || region.min_lat == region.max_lat || region.min_lon == region.max_lon) {
         return std::unexpected("Rendering requires finite, ordered bounds with nonzero latitude and longitude spans");
     }
@@ -383,29 +407,50 @@ Result<void> Map::render(BLContext& ctx, const Region& region)
         return bounds.min_lon <= region.max_lon && bounds.max_lon >= region.min_lon
             && bounds.min_lat <= region.max_lat && bounds.max_lat >= region.min_lat;
     };
+    auto culled = [&](const Region& bounds, bool eligible) {
+        // Use full feature bounds, not their intersection with the viewport.
+        // Keep every ring of a surviving multipolygon, including tiny holes.
+        return eligible && options.m_minAreaSizePixels > 0
+            && (bounds.max_lon - bounds.min_lon) / (region.max_lon - region.min_lon) * size.w < options.m_minAreaSizePixels
+            && (bounds.max_lat - bounds.min_lat) / (region.max_lat - region.min_lat) * size.h < options.m_minAreaSizePixels;
+    };
     for (const auto& fill : m_fills) {
+        const auto& bounds = fill.m_isArea ? m_areas[fill.m_index].m_bounds : m_ways[fill.m_index].m_bounds;
+        const bool eligible = fill.m_isArea ? m_areas[fill.m_index].m_smallAreaLod : m_ways[fill.m_index].m_smallAreaLod;
+        if (stats) {
+            ++stats->fillsConsidered;
+        }
+        if (!visible(bounds)) {
+            if (stats) {
+                ++stats->fillsOffscreen;
+            }
+            continue;
+        }
+        if (culled(bounds, eligible)) {
+            if (stats) {
+                ++stats->fillsCulled;
+            }
+            continue;
+        }
+        if (stats) {
+            ++stats->fillsDrawn;
+        }
         BLPath path;
         if (fill.m_isArea) {
             const auto& area = m_areas[fill.m_index];
-            if (!visible(area.m_bounds)) {
-                continue;
-            }
             for (const auto& ring : area.rings) {
                 appendRing(path, ring);
             }
             status |= ctx.fill_path(path, BLRgba32(area.m_style.fill));
         } else {
             const auto& way = m_ways[fill.m_index];
-            if (!visible(way.m_bounds)) {
-                continue;
-            }
             appendRing(path, way.nodes);
             status |= ctx.fill_path(path, BLRgba32(way.m_style.fill));
         }
     }
     for (auto index : m_lines) {
         const auto* feature = &m_ways[index];
-        if (!visible(feature->m_bounds)) {
+        if (!visible(feature->m_bounds) || culled(feature->m_bounds, feature->m_smallAreaLod)) {
             continue;
         }
         const auto& way = feature->nodes;
@@ -523,7 +568,8 @@ Result<void> Map::render(BLContext& ctx, const Region& region)
         return best;
     };
     for (const auto& way : m_ways) {
-        if (way.m_label.m_name.empty() || way.areaMember || !visible(way.m_bounds)) {
+        if (way.m_label.m_name.empty() || way.areaMember || !visible(way.m_bounds)
+            || culled(way.m_bounds, way.m_smallAreaLod)) {
             continue;
         }
         if (way.m_closed) {
@@ -561,7 +607,8 @@ Result<void> Map::render(BLContext& ctx, const Region& region)
         }
     }
     for (const auto& area : m_areas) {
-        if (area.m_label.m_name.empty() || !visible(area.m_bounds)) {
+        if (area.m_label.m_name.empty() || !visible(area.m_bounds)
+            || culled(area.m_bounds, area.m_smallAreaLod)) {
             continue;
         }
         std::vector<const std::vector<std::int64_t>*> rings;

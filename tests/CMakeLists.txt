@@ -9,3 +9,5 @@ add_test(NAME osm_areas COMMAND osm_tests areas)
 add_test(NAME osm_labels COMMAND osm_tests labels)
 add_test(NAME osm_view COMMAND osm_tests view)
 add_test(NAME osm_resize COMMAND osm_tests resize)
+
+add_test(NAME osm_lod COMMAND osm_tests lod)

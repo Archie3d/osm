@@ -90,6 +90,134 @@ void testLoader()
     }
 }
 
+// Rectangles use exact binary fractions so threshold-boundary tests are stable.
+std::string lodRectangle(int id, double x, double y, double width, double height,
+    const std::string& tags)
+{
+    std::string xml;
+    const double xs[] = {x, x + width, x + width, x};
+    const double ys[] = {y, y, y + height, y + height};
+    for (int i = 0; i < 4; ++i) {
+        xml += "<node id='" + std::to_string(id * 4 + i) + "' lon='" + std::to_string(xs[i])
+            + "' lat='" + std::to_string(ys[i]) + "'/>";
+    }
+    xml += "<way id='" + std::to_string(id) + "'>";
+    for (int i = 0; i <= 4; ++i) {
+        xml += "<nd ref='" + std::to_string(id * 4 + i % 4) + "'/>";
+    }
+    return xml + tags + "</way>";
+}
+
+void testLod()
+{
+    TemporaryFile file;
+    const std::string building = "<tag k='building' v='yes'/>";
+    const std::string name = "<tag k='name' v='Tiny building'/>";
+    auto load = [&](const std::string& body) {
+        auto result = file.load("<osm>" + body + "</osm>");
+        check(result.has_value(), "LOD fixture loads");
+        return *result;
+    };
+    BLImage image(128, 128, BL_FORMAT_PRGB32);
+    BLContext context(image);
+    osm::Map::RenderStats stats;
+    auto draw = [&](osm::Map& map, osm::Map::Region region, double threshold = 2) {
+        context.clear_all();
+        check(map.render(context, region, {threshold}, &stats).has_value(), "LOD render");
+        check(stats.fillsConsidered == stats.fillsOffscreen + stats.fillsCulled + stats.fillsDrawn,
+            "Fill counters partition considered features");
+    };
+    auto pixels = [&]() {
+        BLImageData data;
+        image.get_data(&data);
+        std::vector<uint32_t> result;
+        for (int y = 0; y < 128; ++y) {
+            const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const unsigned char*>(data.pixel_data) + y * data.stride);
+            result.insert(result.end(), row, row + 128);
+        }
+        return result;
+    };
+    auto tiny = load(lodRectangle(1, 0, 0, 1, 1, building + name));
+    draw(tiny, {-64, -64, 64, 64});
+    const auto hidden = pixels();
+    check(stats.fillsCulled == 1 && std::all_of(hidden.begin(), hidden.end(), [](auto p) { return p == 0; }),
+        "Tiny geometry and its label disappear together");
+    draw(tiny, {-64, -64, 64, 64}, 0);
+    const auto fullDetail = pixels();
+    check(stats.fillsDrawn == 1 && fullDetail != hidden, "Zero disables LOD");
+    context.clear_all();
+    check(tiny.render(context, {-64, -64, 64, 64}).has_value() && pixels() == hidden, "Default API enables LOD");
+    draw(tiny, {-64, -64, 64, 64}, 1);
+    check(stats.fillsDrawn == 1 && pixels() == fullDetail, "Exact threshold retained");
+    draw(tiny, {-32, -32, 32, 32});
+    check(stats.fillsDrawn == 1, "Zoom restores geometry");
+    draw(tiny, {-64, -64, -32, -32});
+    check(stats.fillsOffscreen == 1 && stats.fillsCulled == 0, "Offscreen count distinct from LOD");
+    BLImage larger(256, 256, BL_FORMAT_PRGB32);
+    BLContext largerContext(larger);
+    check(tiny.render(largerContext, {-64, -64, 64, 64}, {}, &stats).has_value()
+        && stats.fillsDrawn == 1, "Target pixel size controls LOD");
+    for (const auto dimensions : {std::pair{0.5, 8.0}, std::pair{8.0, 0.5}}) {
+        auto narrow = load(lodRectangle(1, 0, 0, dimensions.first, dimensions.second, building));
+        draw(narrow, {-64, -64, 64, 64});
+        check(stats.fillsDrawn == 1, "Either long dimension preserves narrow polygons");
+    }
+    auto land = load(lodRectangle(1, 0, 0, 1, 1, "<tag k='landuse' v='meadow'/>"));
+    draw(land, {-64, -64, 64, 64});
+    check(stats.fillsCulled == 1, "Land-use category participates");
+    for (const std::string tags : {building + "<tag k='highway' v='primary'/>",
+        building + "<tag k='waterway' v='stream'/>", std::string("<tag k='natural' v='water'/>")}) {
+        auto retained = load(lodRectangle(1, 0, 0, 1, 1, tags));
+        draw(retained, {-64, -64, 64, 64});
+        const auto withLod = pixels();
+        check(stats.fillsDrawn == 1, "Protected feature category retained");
+        draw(retained, {-64, -64, 64, 64}, 0);
+        check(pixels() == withLod, "Protected feature pixels unchanged");
+    }
+    auto line = load(lodRectangle(1, 0, 0, 1, 1, building + "<tag k='area' v='no'/>"));
+    draw(line, {-64, -64, 64, 64});
+    const auto linePixels = pixels();
+    draw(line, {-64, -64, 64, 64}, 0);
+    check(pixels() == linePixels, "Non-area building strokes unchanged");
+    const std::string relation = "<relation id='10'><member type='way' ref='1' role='outer'/>"
+        "<member type='way' ref='2' role='inner'/><tag k='type' v='multipolygon'/>" + building + name + "</relation>";
+    auto area = load(lodRectangle(1, 0, 0, 1, 1, "") + lodRectangle(2, 0.25, 0.25, 0.5, 0.5, "") + relation);
+    draw(area, {-64, -64, 64, 64});
+    check(stats.fillsConsidered == 1 && stats.fillsCulled == 1 && pixels() == hidden,
+        "Relation geometry and labels culled as one feature");
+    auto unnamedRelation = relation;
+    unnamedRelation.erase(unnamedRelation.find(name), name.size());
+    auto holed = load(lodRectangle(1, -32, -32, 64, 64, "") + lodRectangle(2, 0, 0, 1, 1, "") + unnamedRelation);
+    draw(holed, {-64, -64, 64, 64});
+    const auto withHole = pixels();
+    draw(holed, {-64, -64, 64, 64}, 0);
+    check(withHole == pixels() && withHole[63 * 128 + 64] == 0, "Tiny hole preserved in large polygon");
+    draw(holed, {-64, -64, -31.5, -31.5});
+    check(stats.fillsDrawn == 1, "Small viewport intersection does not cull large polygon");
+    for (double invalid : {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        check(!tiny.render(context, {-64, -64, 64, 64}, {invalid}, &stats), "Invalid LOD threshold rejected");
+        check(stats.fillsConsidered == 0, "Stats reset on invalid render");
+    }
+
+    std::string dense;
+    for (int y = 0; y < 100; ++y) {
+        for (int x = 0; x < 100; ++x) {
+            dense += lodRectangle(y * 100 + x + 1, x * 0.5, y * 0.5, 0.25, 0.25, building);
+        }
+    }
+    auto city = load(dense);
+    for (double span : {64.0, 32.0, 8.0}) {
+        for (double threshold : {0.0, 2.0}) {
+            const auto start = std::chrono::steady_clock::now();
+            draw(city, {0, 0, span, span}, threshold);
+            const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::cout << "LOD span=" << span << " threshold=" << threshold << " ms=" << milliseconds
+                << " considered=" << stats.fillsConsidered << " offscreen=" << stats.fillsOffscreen
+                << " culled=" << stats.fillsCulled << " drawn=" << stats.fillsDrawn << '\n';
+        }
+    }
+}
+
 void testRenderer()
 {
     auto map = osm::Map::load(OSM_FIXTURE);
@@ -475,6 +603,8 @@ int main(int argc, char* argv[])
         check(argc == 2, "Specify loader or renderer");
         if (std::string(argv[1]) == "loader") {
             testLoader();
+        } else if (std::string(argv[1]) == "lod") {
+            testLod();
         } else if (std::string(argv[1]) == "renderer") {
             testRenderer();
         } else if (std::string(argv[1]) == "areas") {
